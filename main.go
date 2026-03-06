@@ -1,7 +1,12 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -14,19 +19,21 @@ type Todo struct {
 	Done  bool   `json:"done"`
 }
 
-var todos []Todo
-var nextID = 1
+type M = map[string]string
 
-func findIndexByID(id int) int {
-	for i, t := range todos {
-		if t.ID == id {
-			return i
-		}
-	}
-	return -1
-}
+var (
+	todos    []Todo
+	nextID   = 1
+	dataFile = "todos.json"
+)
 
 func main() {
+	// 1) 啟動時載入 JSON（若不存在就忽略錯誤）
+	if err := loadFromJSON(dataFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		panic(err)
+	}
+	recomputeNextID()
+
 	// 建立 Echo 實例（網站伺服器）
 	e := echo.New()
 
@@ -130,6 +137,84 @@ func main() {
 		return c.JSON(http.StatusOK, todos[idx])
 	})
 
+	// 刪除任務：DELETE /todos/:id
+	e.DELETE("/todos/:id", func(c echo.Context) error {
+		idStr := c.Param("id")
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, M{"error": "id must be a number"})
+		}
+		idx := findIndexByID(id)
+		if idx == -1 {
+			return c.JSON(http.StatusNotFound, M{"error": "todo not found"})
+		}
+		// 移除 idx
+		todos = append(todos[:idx], todos[idx+1:]...)
+		if err := saveToJSON(dataFile); err != nil {
+			return c.JSON(http.StatusInternalServerError, M{"error": "save failed"})
+		}
+		return c.NoContent(http.StatusNoContent) // 204，純刪除不用回 body
+	})
+
 	// 啟動伺服器，監聽在 http://localhost:1323
 	e.Start(":1323")
+}
+
+/* ----------------- 工具區 ----------------- */
+
+// 找到 id 的索引；找不到回 -1
+func findIndexByID(id int) int {
+	for i, t := range todos {
+		if t.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// 啟動後根據載入資料重算 nextID
+func recomputeNextID() {
+	maxID := 0
+	for _, t := range todos {
+		if t.ID > maxID {
+			maxID = t.ID
+		}
+	}
+	nextID = maxID + 1
+}
+
+// 讀檔：把 todos.json 載回 todos
+func loadFromJSON(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+	// 空檔案處理
+	if len(strings.TrimSpace(string(b))) == 0 {
+		todos = nil
+		return nil
+	}
+	return json.Unmarshal(b, &todos)
+}
+
+// 寫檔（安全寫入）：先寫暫存檔，再 rename 成正式檔
+func saveToJSON(path string) error {
+	dir := filepath.Dir(path)
+	tmp := filepath.Join(dir, ".todos.tmp.json")
+
+	b, err := json.MarshalIndent(todos, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
