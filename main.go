@@ -1,15 +1,14 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
-	"io"
+	"context"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 )
 
@@ -17,143 +16,183 @@ type Todo struct {
 	ID    int    `json:"id"`
 	Title string `json:"title"`
 	Done  bool   `json:"done"`
+	// 可選：CreatedAt time.Time `json:"created_at"`
 }
 
 type M = map[string]string
 
-var (
-	todos    []Todo
-	nextID   = 1
-	dataFile = "todos.json"
-)
-
 func main() {
-	// 1) 啟動時載入 JSON（若不存在就忽略錯誤）
-	if err := loadFromJSON(dataFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+	// 1) 讀取 DATABASE_URL
+	dsn := os.Getenv("DATABASE_URL")
+	if strings.TrimSpace(dsn) == "" {
+		panic("DATABASE_URL is empty. Please set DATABASE_URL environment variable.")
+	}
+
+	// 2) 建連線池
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
 		panic(err)
 	}
-	recomputeNextID()
+	defer pool.Close()
+
+	// 3) 建表（如果不存在）
+	if _, err := pool.Exec(ctx, `
+				CREATE TABLE IF NOT EXISTS todos (
+				id SERIAL PRIMARY KEY,
+				title TEXT NOT NULL,
+				done BOOLEAN NOT NULL DEFAULT FALSE,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+				)`); err != nil {
+		panic(err)
+	}
 
 	// 建立 Echo 實例（網站伺服器）
 	e := echo.New()
 
 	// 路由：GET /hello
 	e.GET("/hello", func(c echo.Context) error {
-		return c.String(http.StatusOK, "Hello, TodoList!")
+		return c.String(http.StatusOK, "Hello, TodoList with Postgres!")
 	})
 
 	// 新增任務：POST /todos
 	e.POST("/todos", func(c echo.Context) error {
-		var newTodo Todo
-		if err := c.Bind(&newTodo); err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{
-				"error": "invalid request",
-			})
+		var req struct {
+			Title string `json:"title"`
+		}
+		if err := c.Bind(&req); err != nil || strings.TrimSpace(req.Title) == "" {
+			return c.JSON(http.StatusBadRequest, M{"error": "invalid request"})
 		}
 
-		newTodo.ID = nextID
-		newTodo.Done = false
-		nextID++
-
-		todos = append(todos, newTodo)
-
-		return c.JSON(http.StatusOK, newTodo)
+		var t Todo
+		row := pool.QueryRow(ctx,
+			`INSERT INTO todos (title) VALUES ($1) RETURNING id, title, done`,
+			req.Title,
+		)
+		if err := row.Scan(&t.ID, &t.Title, &t.Done); err != nil {
+			return c.JSON(http.StatusInternalServerError, M{"error": "db insert failed"})
+		}
+		return c.JSON(http.StatusOK, t)
 	})
 
-	// 列出全部任務：GET /todos
+	// 列出全部：GET /todos
 	e.GET("/todos", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, todos)
-	})
-
-	// 查單一任務：GET /todos/:id
-	e.GET("/todos/:id", func(c echo.Context) error {
-		idStr := c.Param("id")
-		id, err := strconv.Atoi(idStr)
+		rows, err := pool.Query(ctx, `SELECT id, title, done FROM todos ORDER BY id`)
 		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{
-				"error": "id must be a number",
-			})
+			return c.JSON(http.StatusInternalServerError, M{"error": "db query failed"})
 		}
+		defer rows.Close()
 
-		for _, t := range todos {
-			if t.ID == id {
-				return c.JSON(http.StatusOK, t)
+		var out []Todo
+		for rows.Next() {
+			var t Todo
+			if err := rows.Scan(&t.ID, &t.Title, &t.Done); err != nil {
+				return c.JSON(http.StatusInternalServerError, M{"error": "scan failed"})
 			}
+			out = append(out, t)
 		}
-		return c.JSON(http.StatusNotFound, map[string]string{
-			"error": "todo not found",
-		})
+		return c.JSON(http.StatusOK, out)
 	})
 
-	// 整筆更新：PUT /todos/:id
+	// 查單一：GET /todos/:id
+	e.GET("/todos/:id", func(c echo.Context) error {
+		id, bad := parseID(c)
+		if bad != nil {
+			return bad
+		}
+		var t Todo
+		row := pool.QueryRow(ctx, `SELECT id, title, done FROM todos WHERE id=$1`, id)
+		if err := row.Scan(&t.ID, &t.Title, &t.Done); err != nil {
+			return c.JSON(http.StatusNotFound, M{"error": "todo not found"})
+		}
+		return c.JSON(http.StatusOK, t)
+	})
+
+	// 整筆更新：PUT /todos/:id（改 title / done）
 	e.PUT("/todos/:id", func(c echo.Context) error {
-		idStr := c.Param("id")
-		id, err := strconv.Atoi(idStr)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "id must be a number"})
+		id, bad := parseID(c)
+		if bad != nil {
+			return bad
 		}
 		var req struct {
 			Title string `json:"title"`
 			Done  *bool  `json:"done"`
 		}
 		if err := c.Bind(&req); err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return c.JSON(http.StatusBadRequest, M{"error": "invalid json"})
 		}
 		if strings.TrimSpace(req.Title) == "" {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "title cannot be empty"})
+			return c.JSON(http.StatusBadRequest, M{"error": "title cannot be empty"})
 		}
-		idx := findIndexByID(id)
-		if idx == -1 {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "todo not found"})
+
+		var currentDone bool
+		if err := pool.QueryRow(ctx, `SELECT done FROM todos WHERE id=$1`, id).Scan(&currentDone); err != nil {
+			return c.JSON(http.StatusNotFound, M{"error": "todo not found"})
 		}
-		todos[idx].Title = req.Title
+		newDone := currentDone
 		if req.Done != nil {
-			todos[idx].Done = *req.Done
+			newDone = *req.Done
 		}
-		return c.JSON(http.StatusOK, todos[idx])
+
+		var t Todo
+		row := pool.QueryRow(ctx,
+			`UPDATE todos SET title=$1, done=$2 WHERE id=$3 RETURNING id, title, done`,
+			req.Title, newDone, id,
+		)
+		if err := row.Scan(&t.ID, &t.Title, &t.Done); err != nil {
+			return c.JSON(http.StatusInternalServerError, M{"error": "db update failed"})
+		}
+		return c.JSON(http.StatusOK, t)
 	})
 
 	// 部分更新（完成狀態）：PATCH /todos/:id/done
 	e.PATCH("/todos/:id/done", func(c echo.Context) error {
-		idStr := c.Param("id")
-		id, err := strconv.Atoi(idStr)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "id must be a number"})
-		}
-		idx := findIndexByID(id)
-		if idx == -1 {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "todo not found"})
+		id, bad := parseID(c)
+		if bad != nil {
+			return bad
 		}
 		var req struct {
 			Done *bool `json:"done"`
 		}
 		_ = c.Bind(&req)
-		if req.Done == nil {
-			// 切換模式
-			todos[idx].Done = !todos[idx].Done
-		} else {
-			todos[idx].Done = *req.Done
-		}
-		return c.JSON(http.StatusOK, todos[idx])
-	})
 
-	// 刪除任務：DELETE /todos/:id
-	e.DELETE("/todos/:id", func(c echo.Context) error {
-		idStr := c.Param("id")
-		id, err := strconv.Atoi(idStr)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, M{"error": "id must be a number"})
+		if req.Done == nil {
+			var t Todo
+			row := pool.QueryRow(ctx,
+				`UPDATE todos SET done = NOT done WHERE id=$1 RETURNING id, title, done`,
+				id,
+			)
+			if err := row.Scan(&t.ID, &t.Title, &t.Done); err != nil {
+				return c.JSON(http.StatusNotFound, M{"error": "todo not found"})
+			}
+			return c.JSON(http.StatusOK, t)
 		}
-		idx := findIndexByID(id)
-		if idx == -1 {
+
+		var t Todo
+		row := pool.QueryRow(ctx,
+			`UPDATE todos SET done=$1 WHERE id=$2 RETURNING id, title, done`,
+			*req.Done, id,
+		)
+		if err := row.Scan(&t.ID, &t.Title, &t.Done); err != nil {
 			return c.JSON(http.StatusNotFound, M{"error": "todo not found"})
 		}
-		// 移除 idx
-		todos = append(todos[:idx], todos[idx+1:]...)
-		if err := saveToJSON(dataFile); err != nil {
-			return c.JSON(http.StatusInternalServerError, M{"error": "save failed"})
+		return c.JSON(http.StatusOK, t)
+	})
+
+	// 刪除：DELETE /todos/:id
+	e.DELETE("/todos/:id", func(c echo.Context) error {
+		id, bad := parseID(c)
+		if bad != nil {
+			return bad
 		}
-		return c.NoContent(http.StatusNoContent) // 204，純刪除不用回 body
+		ct, err := pool.Exec(ctx, `DELETE FROM todos WHERE id=$1`, id)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, M{"error": "db delete failed"})
+		}
+		if ct.RowsAffected() == 0 {
+			return c.JSON(http.StatusNotFound, M{"error": "todo not found"})
+		}
+		return c.NoContent(http.StatusNoContent)
 	})
 
 	// 啟動伺服器，監聽在 http://localhost:1323
@@ -162,59 +201,14 @@ func main() {
 
 /* ----------------- 工具區 ----------------- */
 
-// 找到 id 的索引；找不到回 -1
-func findIndexByID(id int) int {
-	for i, t := range todos {
-		if t.ID == id {
-			return i
-		}
-	}
-	return -1
-}
-
-// 啟動後根據載入資料重算 nextID
-func recomputeNextID() {
-	maxID := 0
-	for _, t := range todos {
-		if t.ID > maxID {
-			maxID = t.ID
-		}
-	}
-	nextID = maxID + 1
-}
-
-// 讀檔：把 todos.json 載回 todos
-func loadFromJSON(path string) error {
-	f, err := os.Open(path)
+func parseID(c echo.Context) (int, error) {
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
 	if err != nil {
-		return err
+		return 0, c.JSON(http.StatusBadRequest, M{"error": "id must be a number"})
 	}
-	defer f.Close()
-
-	b, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
-	// 空檔案處理
-	if len(strings.TrimSpace(string(b))) == 0 {
-		todos = nil
-		return nil
-	}
-	return json.Unmarshal(b, &todos)
+	return id, nil
 }
 
-// 寫檔（安全寫入）：先寫暫存檔，再 rename 成正式檔
-func saveToJSON(path string) error {
-	dir := filepath.Dir(path)
-	tmp := filepath.Join(dir, ".todos.tmp.json")
-
-	b, err := json.MarshalIndent(todos, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
+// （可選）單純示範用：若你想拿 created_at 也行
+var _ = time.Now
