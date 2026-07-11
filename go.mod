@@ -3,7 +3,7 @@ module todo-list
 go 1.25.3
 
 require (
-	github.com/jackc/pgx/v5 v5.9.0
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/labstack/echo/v4 v4.15.1
 )
 
